@@ -1,0 +1,635 @@
+---
+title: "GStore EDA"
+author: "Troy Walters"
+date: "September 13, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, fig.align='center')
+
+```
+
+* [Libraries](#libraries)
+* [Load Data](#data)
+* [Data Preprocessing](#preprocessing)
+* [Missing Values](#missing)
+* [Data Exploration](#eda)
+    + [Target Value](#target)
+    + [Device Features](#device)
+    + [Geographic Features](#geographic)
+    + [Totals Features](#totals)
+    + [Traffic Source Features](#traffic)
+    
+
+## Libraries {#libraries}
+
+```{r, message=FALSE}
+
+library(data.table)
+library(jsonlite)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(lubridate)
+library(purrr)
+library(ggplot2)
+library(gridExtra)
+library(countrycode)
+library(highcharter)
+library(ggExtra)
+
+```
+
+
+## Load Data {#load}
+
+```{r, message=FALSE}
+
+dtrain <- read_csv('../input/train.csv')
+#dtest <- read_csv('../input/test.csv')
+
+```
+
+## Data Preprocessing {#preprocessing}
+
+```{r}
+
+glimpse(dtrain)
+
+```
+
+```{r}
+
+# convert date column from character to Date class
+dtrain$date <- as.Date(as.character(dtrain$date), format='%Y%m%d')
+
+# convert visitStartTime to POSIXct
+dtrain$visitStartTime <- as_datetime(dtrain$visitStartTime)
+
+```
+
+
+Several of the columns in the data set contain json. We need a way to parse this into several columns. After struggling with this myself for some time, I eventually found kaggler ML's [great code](https://www.kaggle.com/mrlong/r-flatten-json-columns-to-make-single-data-frame) for handling this. All credit to them. 
+
+```{r}
+
+tr_device <- paste("[", paste(dtrain$device, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_geoNetwork <- paste("[", paste(dtrain$geoNetwork, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_totals <- paste("[", paste(dtrain$totals, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_trafficSource <- paste("[", paste(dtrain$trafficSource, collapse = ","), "]") %>% fromJSON(flatten = T)
+
+dtrain <- cbind(dtrain, tr_device, tr_geoNetwork, tr_totals, tr_trafficSource) %>%
+  as.data.table()
+
+# drop the old json columns
+dtrain[, c('device', 'geoNetwork', 'totals', 'trafficSource') := NULL]
+
+```
+
+Some of the newly parsed columns from json have various values that can be converted to NA. This includes values such as '(not set)' and 'not available in demo dataset'. Although distinguishing between these values may be useful during modeling, I am going to convert them all to NA for the purposes of visualization. 
+
+```{r}
+
+# values to convert to NA
+na_vals <- c('unknown.unknown', '(not set)', 'not available in demo dataset', 
+             '(not provided)', '(none)', '<NA>')
+
+for(col in names(dtrain)) {
+  
+  set(dtrain, i=which(dtrain[[col]] %in% na_vals), j=col, value=NA)
+  
+}
+
+```
+
+Several of the newly parsed json columns have only 1 unique value, e.g. 'not available in demo dataset'. These columns are obviously useless, so we drop them here. 
+
+```{r}
+
+# get number of unique values in each column
+unique <- sapply(dtrain, function(x) { length(unique(x[!is.na(x)])) })
+
+# subset to == 1
+one_val <- names(unique[unique <= 1])
+
+# but keep bounces and newVisits
+one_val = setdiff(one_val, c('bounces', 'newVisits'))
+
+# drop columns from dtrain
+dtrain[, (one_val) := NULL]
+
+```
+
+Now that that's out of the way, let's take a look again at what we've got. 
+
+```{r}
+
+glimpse(dtrain)
+
+```
+
+All of the columns that were converted from json are of class character. For some, we will need to change this. 
+
+```{r}
+
+# character columns to convert to numeric
+num_cols <- c('hits', 'pageviews', 'bounces', 'newVisits',
+              'transactionRevenue')
+
+# change columns to numeric
+dtrain[, (num_cols) := lapply(.SD, as.numeric), .SDcols=num_cols]
+
+```
+
+As noted in this [discussion thread](https://www.kaggle.com/c/google-analytics-customer-revenue-prediction/discussion/65775), the transaction revenue column is multiplied by $10^6$. For visualization purposes, I am going to convert this back to unit dollars, but remember that in the competition we will be predicting the log of transaction revenue as it appears in the data set. 
+
+```{r}
+
+#Divide transactionRevenue by 1,000,000
+dtrain[, transactionRevenue := transactionRevenue / 1e+06]
+
+```
+
+
+## Missing Values {#missing}
+
+```{r, fig.width=8}
+
+data.table(
+  pmiss = sapply(dtrain, function(x) { (sum(is.na(x)) / length(x)) }),
+  column = names(dtrain)
+  ) %>%
+ggplot(aes(x = reorder(column, -pmiss), y = pmiss)) +
+geom_bar(stat = 'identity', fill = 'steelblue') + 
+  scale_y_continuous(labels = scales::percent) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  labs(
+    title='Missing data by feature',
+    x='Feature',
+    y='% missing')
+
+
+```
+
+
+## Data Exploration {#eda}
+
+What is the time range over which these data were collected?
+
+```{r}
+
+time_range <- range(dtrain$date)
+print(time_range)
+```
+
+We have one year worth of data from `r time_range[1]` to `r time_range[2]`.
+
+### Target Variable (transaction revenue) {#target}
+
+The object of this competition is to predict total transaction revenue, so let' take a look at this variable first. What is the range of transaction revenue, or dollars spent per visit. 
+
+```{r}
+
+rev_range <- round(range(dtrain$transactionRevenue, na.rm=TRUE), 2)
+print(rev_range)
+
+```
+
+Over the course of August, revenue from a single visit ranged from `r sprintf("$%.2f", rev_range[1])` to `r sprintf("$%.2f", rev_range[2])`.
+
+Now let's look at the distribution of revenue from individual visits. Here I am using the log of transaction revenue to better display the distribution. 
+
+```{r}
+
+dtrain %>% 
+  ggplot(aes(x=log(transactionRevenue), y=..density..)) + 
+  geom_histogram(fill='steelblue', na.rm=TRUE, bins=40) + 
+  geom_density(aes(x=log(transactionRevenue)), fill='orange', color='orange', alpha=0.3, na.rm=TRUE) + 
+  labs(
+    title = 'Distribution of transaction revenue',
+    x = 'Natural log of transaction revenue'
+  )
+
+```
+
+The mean of the natural log of transaction revenue appears to be around 4 and is approximately normally distributed. 
+
+Now let's take a look at daily revenue over the time period of the data set. 
+
+```{r, fig.height=8, fig.width=10, message=FALSE}
+
+g1 <- dtrain[, .(n = .N), by=date] %>%
+  ggplot(aes(x=date, y=n)) + 
+  geom_line(color='steelblue') +
+  geom_smooth(color='orange') + 
+  labs(
+    x='',
+    y='Visits (000s)',
+    title='Daily visits'
+  )
+
+g2 <- dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=date] %>%
+  ggplot(aes(x=date, y=revenue)) + 
+  geom_line(color='steelblue') +
+  geom_smooth(color='orange') + 
+  labs(
+    x='',
+    y='Revenue (unit dollars)',
+    title='Daily transaction revenue'
+  )
+
+grid.arrange(g1, g2, nrow=2)
+
+
+```
+
+The daily revenue data are pretty volatile, but there appears to be a regular pattern here. There seems to be a regular pattern of highs and lows. We'll have to take a closer look at this. The smoothing line indicates that daily revenue, fluctuations aside, has remained fairly steady over the course of the year. 
+
+Now let's look at revenue by hour of day. 
+
+```{r, fig.width=8, fig.height=6}
+
+g1 <-
+  dtrain[, .(visitHour = hour(visitStartTime))][
+    , .(visits = .N), by = visitHour] %>%
+  ggplot(aes(x = visitHour, y = visits / 1000)) +
+  geom_line(color = 'steelblue', size = 1) +
+  geom_point(color = 'steelblue', size = 2) +
+  labs(
+  x = 'Hour of day',
+  y = 'Visits (000s)',
+  title = 'Aggregate visits by hour of day (UTC)',
+  subtitle = 'August 1, 2016 to August 1, 2017'
+  
+  )
+
+g2 <-
+  dtrain[, .(transactionRevenue, visitHour = hour(visitStartTime))][
+    , .(revenue = sum(transactionRevenue, na.rm =
+  T)), by = visitHour] %>%
+  ggplot(aes(x = visitHour, y = revenue / 1000)) +
+  geom_line(color = 'steelblue', size = 1) +
+  geom_point(color = 'steelblue', size = 2) +
+  labs(
+  x = 'Hour of day',
+  y = 'Transaction revenue (000s)',
+  title = 'Aggregate revenue by hour of day (UTC)',
+  subtitle = 'August 1, 2016 to August 1, 2017'
+
+  )
+
+grid.arrange(g1, g2, nrow = 2)
+
+
+```
+
+
+Now let's look at transaction revenue grouped by channel, which is the way in which the user came to the Google Merchandise Store. 
+
+```{r, fig.width=10}
+
+g1 <- dtrain[, .(n = .N), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, -n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Channel Grouping',
+       y='Visits (000s)',
+       title='Visits by channel grouping')
+
+g2 <- dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, revenue), y=revenue/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  coord_flip() + 
+  labs(x='Channel Grouping',
+       y='Revenue (dollars, 000s)',
+       title='Total revenue by channel grouping')
+
+
+g3 <- dtrain[, .(meanRevenue = mean(transactionRevenue, na.rm=TRUE)), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, meanRevenue), y=meanRevenue)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(x='', 
+       y='Revenue (dollars)',
+       title='Mean revenue by channel grouping')
+
+
+g1
+grid.arrange(g2, g3, ncol = 2)
+
+```
+
+We see that in terms of total revenue, "Referral" accounts for the largest share. "Display" had the highest average revenue, but be aware that this may be due to a particularly large transaction, as the number of visits from "Display" are very small. 
+
+### Device Features {#device}
+
+```{r, fig.height=8}
+
+g1 <- dtrain[, .(n=.N/1000), by=operatingSystem][
+  n > 0.001
+] %>%
+  ggplot(aes(x=reorder(operatingSystem, -n), y=n)) + 
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Operating System', 
+       y='# of visits in data set (000s)',
+       title='Distribution of visits by device operating system') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+g2 <- dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=operatingSystem][
+  revenue > 0, 
+] %>%
+  ggplot(aes(x=reorder(operatingSystem, -revenue), y=revenue)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Operating System',
+       y='Revenue (unit dollars)',
+       title='Distribution of revenue by device operating system') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+grid.arrange(g1, g2, nrow=2)
+
+```
+
+
+Interestingly, we see that although Windows accounted for more records in the data set than any other operating system, Macintosh accounted for more of transaction revenue than other operating systems by a large margin. 
+
+```{r, fig.height=8}
+
+g1 <- dtrain[, .(n=.N/1000), by=browser][
+  1:10
+] %>%
+  ggplot(aes(x=reorder(browser, -n), y=n)) + 
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Browser', 
+       y='# of visits in data set (000s)',
+       title='Distribution of visits by browser (Top 10 browsers)') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+g2 <- dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)/1000), by=browser][
+  1:10
+] %>%
+  ggplot(aes(x=reorder(browser, -revenue), y=revenue)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Browser',
+       y='Revenue (dollars, 000s)',
+       title='Distribution of revenue by browser (top 10 browsers)') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+grid.arrange(g1, g2, nrow=2)
+
+```
+
+
+
+```{r, fig.height=5, fig.width=9}
+g1 <- dtrain[, .(n=.N/1000), by=deviceCategory]%>%
+  ggplot(aes(x=reorder(deviceCategory, -n), y=n)) + 
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Device Category', 
+       y='# of records in data set (000s)',
+       title='Distribution of records by device category') + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+g2 <- dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)/1000), by=deviceCategory] %>%
+  ggplot(aes(x=reorder(deviceCategory, -revenue), y=revenue)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Device category',
+       y='Revenue (dollars, 000s)',
+       title='Distribution of revenue by device category') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+grid.arrange(g1, g2, ncol=2)
+
+```
+
+Let's attempt to determine if there is a difference in transaction revenue between mobile and non-mobile devices:
+
+```{r}
+
+dtrain %>%
+  ggplot(aes(x=log(transactionRevenue), y=..density.., fill=isMobile)) +
+  geom_density(alpha=0.5) + 
+  scale_fill_manual(values = c('steelblue', 'orange')) + 
+  labs(title='Distribution of log revenue by mobile and non-mobile devices')
+```
+
+There seems to a smaller mean transaction revenue for mobile devices than non-mobile devices, although we'd want to perform some statistical testing to determine if this effect is statistically significant or just occuring by random chance in this particular sample. 
+
+### Geographic Features {#geographic}
+
+```{r}
+
+dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)/1000), by = continent][
+  !is.na(continent),
+] %>%
+  ggplot(aes(x=reorder(continent, revenue), y=revenue)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(x='', y='Revenue (dollars, 000s)', title='Total transaction revenue by continent')
+
+```
+
+Revenue from the Americas dwarfs that of any other continent. 
+
+Next, let's look at the distribution of total transaction revenue across countries. We'll use the `highcharter` library to do this. We'll use the `countrycode` package to convert the country names in the training data set to iso3 codes, which we can then use to join with the worldgeojson data from highcharter.
+
+Note that in the below maps, I am using the log of total transaction revenue rather than raw transaction revenue so that we get better dispersion for the choropleth palette. 
+
+
+```{r}
+
+# group by country and calculate total transaction revenue (log)
+by_country <- dtrain[, .(n = .N, revenue = log(sum(transactionRevenue, na.rm=TRUE))), by = country]
+by_country$iso3 <- countrycode(by_country$country, origin='country.name', destination='iso3c')
+by_country[, rev_per_visit := revenue / n]
+
+# create the highcharter map of revenue by country
+highchart() %>%
+    hc_add_series_map(worldgeojson, by_country, value = 'revenue', joinBy = 'iso3') %>%
+    hc_title(text = 'Total transaction revenue by country (natural log)') %>%
+    hc_subtitle(text = "August 2016 to August 2017") %>%
+    hc_tooltip(useHTML = TRUE, headerFormat = "",
+        pointFormat = "{point.country}: ${point.revenue:.0f}")
+
+```
+
+We can also look at individual continents. Since we will want to plot data for multiple continents, we will write a function to do so. 
+
+```{r}
+
+# function to map transaction revenue by continent
+map_by_continent <- function(continent, map_path) {
+  
+  mdata <- dtrain[
+    continent == continent, .(n = .N, revenue = log(sum(transactionRevenue, na.rm=TRUE))), by=country]
+  
+  mdata$iso3 <- countrycode(mdata$country, origin='country.name', destination='iso3c')
+  
+  hcmap(map=map_path, data=mdata, value='revenue', joinBy=c('iso-a3', 'iso3')) %>%
+  hc_title(text = 'Total transaction revenue by country (natural log of unit dollars)') %>%
+  hc_subtitle(text = "August 2016 to August 2017") %>%
+  hc_tooltip(useHTML = TRUE, headerFormat = "",
+      pointFormat = "{point.country}: {point.revenue:.0f}")
+}
+
+```
+
+### {.tabset}
+
+#### Europe
+
+```{r}
+
+# call function for Europe
+map_by_continent(continent='Europe', map_path='custom/europe')
+
+```
+
+#### Africa
+
+```{r}
+
+map_by_continent('Africa', 'custom/africa')
+
+```
+
+The Africa map show us that only four countries in Africa have recorded transaction revenue - Egypt, Kenya, Nigeria, and South Africa. 
+
+#### Asia
+
+```{r}
+
+map_by_continent('Asia', 'custom/asia')
+
+```
+
+#### South America
+
+```{r}
+
+map_by_continent('Americas', 'custom/south-america')
+
+```
+
+#### North America
+
+```{r}
+
+map_by_continent('Americas', 'custom/north-america')
+
+```
+
+#### Antarctica
+
+```{r, eval=FALSE}
+
+map_by_continent('Antarctica', 'custom/antarctica')
+
+```
+
+Made ya look. 
+
+###
+
+Let's now look at visits and revenue by network domain. Here I am going to extract the top-level domain from each entry in networkDomain and make it a separate column. I am excluding the NA data, which includes values that were once '(not set)' and 'unknown.unknown'; however keep in mind that a lot of the visits and transaction revenue in the data set come from unknown domains. 
+
+```{r, fig.height=8}
+
+# split networkDomain column on '.', add to dtrain
+dtrain[, domain := tstrsplit(dtrain$networkDomain, '\\.', keep=c(2))][
+    # add the '.' back in
+  !is.na(domain), domain := paste0('.', domain)
+]
+
+g1 <- dtrain[!is.na(networkDomain), .(n = .N), by = domain][order(-n)][!is.na(domain), ][1:20] %>%
+  ggplot(aes(x=reorder(domain, -n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  labs(title='Number of visits from top-level domains',
+       y='Visits (000s)',
+       x='Top-level domain',
+       subtitle='Unknown domains excluded')
+
+g2 <- dtrain[!is.na(networkDomain), .(revenue = sum(transactionRevenue, na.rm=TRUE)), by = domain][
+  order(-revenue)][
+    !is.na(domain), ][1:20] %>%
+  ggplot(aes(x=reorder(domain, -revenue), y=revenue/1000)) +
+  geom_bar(stat='identity', fill='steelblue') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  labs(
+    title='Revenue from top-level domains', 
+    y='Revenue (000s)', 
+    x='Top-level domain',
+    subtitle='Unknown domains excluded')
+
+grid.arrange(g1, g2)
+
+```
+
+
+### Totals Features {#totals}
+
+Let's look at the behavior of users while on the site and look for anything that might be correlated with transaction revenue. Below are bivariate distribution plots of pageveiews vs transaction revenue, and hits vs transaction revenue.
+
+```{r, fig.width=10}
+
+g1 <- ggplot(dtrain, aes(x=log(pageviews), y=log(transactionRevenue))) + 
+  geom_point(color='steelblue') +
+  geom_smooth(method='lm', color='orange') + 
+  labs(
+    y='Transaction revenue (log)',
+    title='Pageviews vs transaction revenue',
+    subtitle='visit-level')
+  
+
+g2 <- ggplot(dtrain, aes(x=log(hits), y=log(transactionRevenue))) + 
+  geom_point(color='steelblue') +
+  geom_smooth(method='lm', color='orange') + 
+  labs(
+    y='Transaction revenue (log)',
+    title='Hits vs transaction revenue',
+    subtitle='visit-level')
+
+m1 <- ggMarginal(g1, type='histogram', fill='steelblue')
+m2 <- ggMarginal(g2, type='histogram', fill='steelblue')
+
+grid.arrange(m1, m2, nrow = 1, ncol = 2)
+
+```
+
+It's hard to tell from the cloud of points whether there is relationship between hits and revenue and between pageviews and revenue. Fitting a linear model to the data indicate that there is some positive correlation between the two in both cases. 
+
+
+### Traffic Source Features {#traffic}
+
+Let's now turn to the traffic source data. 'Medium' in the general category of the source by which the visitor arrived at the site (reference [here](https://support.google.com/analytics/answer/6099206?hl=en)). Organic refers to an organic search. A cost-per-click paid search is labeled 'cpc'. 'Referral' is a web referral.
+
+```{r, fig.width=8}
+
+g1 <- dtrain[, .(visits = .N), by = medium][
+  !is.na(medium)] %>%
+  ggplot(aes(x=reorder(medium, visits), y=visits / 1000)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(
+    x='Medium',
+    y='Visits (000s)',
+    title='Distribution of visits by medium')
+
+g2 <- dtrain[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by = medium][
+  !is.na(medium)] %>%
+  ggplot(aes(x=reorder(medium, revenue), y=revenue / 1000)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(
+    x='',
+    y='Transaction revenue (dollars, 000s)',
+    title='Distribution of revenue by medium')
+
+grid.arrange(g1, g2, ncol=2)
+
+```
+
+
+More to come...

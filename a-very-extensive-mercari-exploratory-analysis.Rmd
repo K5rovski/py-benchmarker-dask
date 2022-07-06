@@ -1,0 +1,474 @@
+---
+title: "Mercari EDA"
+author: "Troy Walters"
+date: "November 22, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+* [Introduction](#intro)
+* [Libraries](#libraries)
+* [Data Overview](#overview)
+* [Target Variable (Price)](#price)
+* [Item Condition](#condition)
+* [Shipping](#shipping)
+* [Brand](#brand)
+* [Item Categories](#categories)
+* [Feature Interactions](#interactions)
+* [Item Description](#description)
+    + [Set up](#setup)
+    + [N-grams](#ngrams)
+
+## Introduction {#intro}
+
+In this competition, we are asked to predict the price that an item sold for given its description and some other data on category, brand name, and condition. There are a very limited number of features and so this competition will likely come down to modelling the unstructured description text. 
+
+## Libraries {#libraries}
+
+Let's begin by loading the libraries that we will need. 
+
+```{r}
+
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(scales)
+library(stringr)
+library(quanteda)
+library(gridExtra)
+
+```
+
+## Data Overview {#overview}
+```{r}
+
+dtrain <- fread('../input/train.tsv', showProgress = FALSE)
+
+dim(dtrain)
+
+print(object.size(dtrain), units = 'Mb')
+
+summary(dtrain)
+
+```
+
+## Target Variable Analysis (Price) {#price}
+
+Let's start with an analysis of the target variable: price. First, the range of item prices:
+
+```{r}
+
+range(dtrain$price)
+
+```
+
+The item price ranges from 0 (I guess some items on Mercari are given away?) to $2009. Let's look at the histogram of prices. Because price is likely skewed and because there are some 0s, we'll plot the log of price + 1. 
+
+```{r}
+
+ggplot(data = dtrain, aes(x = log(price+1))) + 
+    geom_histogram(fill = 'orangered2') +
+    labs(title = 'Histogram of log item price + 1')
+```
+
+The (log price + 1) appears to be centered around 3 and has a longer right tail due to the 0 bound on the left. 
+
+## Item Condition {#condition}
+
+Next let's look at item condition. 
+
+```{r}
+
+table(dtrain$item_condition_id)
+
+```
+
+```{r}
+
+dtrain[, .N, by = item_condition_id] %>%
+    ggplot(aes(x = as.factor(item_condition_id), y = N/1000)) +
+    geom_bar(stat = 'identity', fill = 'cyan2') + 
+    labs(x = 'Item condition', y = 'Number of items (000s)', title = 'Number of items by condition category')
+```
+
+The item condition ranges from 1 to 5. There are more items of condition 1 than any other. Items of condition 4 and 5 are relatively rare. It's not clear from the data description what the ordinality of this variable is. My assumption is that since conditions 4 and 5 are so rare these are likely the better condition items. We can try and verify this. If a higher item condition is better, it should have a positive correlation with price. Let's see if that is the case.
+
+```{r}
+
+dtrain[, .(.N, median_price = median(price)), by = item_condition_id][order(item_condition_id)]
+
+ggplot(data = dtrain, aes(x = as.factor(item_condition_id), y = log(price + 1))) + 
+    geom_boxplot(fill = 'cyan2', color = 'darkgrey')
+```
+
+Looking at the average price by condition shows a relationship that is not quite as neat as I had hoped. Condition 5 clearly has the highest price, however condition 1 has the next-highest price, followed by condition 2, then 3, then 4. Thanks to kaggler @Juraj for pointing out that in fact condition 1 is the best and 5 is the worst. Condition 5 is a bit of an anomaly in that it has the highest price. However, it also has the fewest number of items, so our point estimate has the most uncertainty.
+
+## Shipping {#shipping}
+
+The `shipping` variable is a dummy variable indicating whether the shipping for the item is paid for by the seller (1) or not (0). 
+
+```{r}
+
+table(dtrain$shipping)
+
+```
+
+My inital thought is that items where the shipping fee is paid by the seller will be higher-priced. However, there are a number of conflating factors. This may be true within specific product categories and item conditions, but not when comparing items on the aggregate. Let's see.
+
+```{r}
+
+dtrain %>%
+    ggplot(aes(x = log(price+1), fill = factor(shipping))) + 
+    geom_density(adjust = 2, alpha = 0.6) + 
+    labs(x = 'Log price', y = '', title = 'Distribution of price by shipping')
+
+```
+
+Items where the shipping is paid by the seller have a lower average price. 
+
+## Brand {#brand}
+
+```{r}
+
+dtrain[, .(median_price = median(price)), by = brand_name] %>%
+    head(25) %>%
+    ggplot(aes(x = reorder(brand_name, median_price), y = median_price)) + 
+    geom_point(color = 'cyan2') + 
+    scale_y_continuous(labels = scales::dollar) + 
+    coord_flip() +
+    labs(x = '', y = 'Median price', title = 'Top 25 most expensive brands') 
+    
+
+```
+
+The Air Jordan and Acacia Swimear brands are by far the most expensive brands, with a median price of $80 and $60 respectively. 
+
+## Item Categories {#categories}
+
+Now let's take a look at the categories. First, how many product categories are there?
+
+```{r}
+
+length(unique(dtrain$category_name))
+
+```
+
+
+```{r}
+
+sort(table(dtrain$category_name), decreasing = TRUE)[1:10]
+
+```
+
+Looking at the ten most popular categories shows that women's apparel is quite popular on Mercari. Of then top ten categories, 5 are women's apparel. Makeup is also a highly listed category as are electronics. 
+
+Now let's examine prices by category. What are the product categories with the highest selling price?
+
+```{r, fig.width = 10}
+
+dtrain[, .(median = median(price)), by = category_name][order(median, decreasing = TRUE)][1:30] %>%
+    ggplot(aes(x = reorder(category_name, median), y = median)) + 
+    geom_point(color = 'orangered2') + 
+    coord_flip() + 
+    labs(x = '', y = 'Median price', title = 'Median price by item category (Top 30)') + 
+    scale_y_continuous(labels = scales::dollar)
+```
+
+The category 'Vintage and Collectibles/Antique/Furniture' has the highest median sale price, followed by 'Kids/Strollers/Standard. 
+
+These product categories are quite specific. It would be interesting to aggregate these to broader categories and explore further. Since subcategories are divided by '/', we can easily obtain each individual item's first and second level categories using `data.table`'s `tstrsplit()` function. 
+
+```{r}
+
+# split the item category_name by '/' and get the first two category levels as separate columns
+dtrain[, c("level_1_cat", "level_2_cat") := tstrsplit(dtrain$category_name, split = "/", keep = c(1,2))]
+
+# peek at the first few rows to make sure this worked correctly. 
+head(dtrain[, c("level_1_cat", "level_2_cat")])
+
+```
+How many top-level categories are there?
+
+```{r}
+
+table(dtrain$level_1_cat)
+
+```
+
+There are 10 top-level categories. How do sale prices vary between these categories?
+
+```{r}
+
+dtrain %>%
+    ggplot(aes(x = level_1_cat, y = log(price+1))) + 
+    geom_boxplot(fill = 'cyan2', color = 'darkgrey') + 
+    coord_flip() + 
+    labs(x = '', y = 'Log price + 1', title = 'Boxplot of price by top-level category')
+
+```
+
+Interestingly, the Men's category seems to have the highest median price. Let's do the same for the second level categories.
+
+
+```{r}
+
+# get number of unique level 2 categories
+length(unique(dtrain$level_2_cat))
+
+```
+
+There are a lot more level 2 categories.
+
+```{r, fig.width=10, fig.height=15}
+
+dtrain %>%
+    ggplot(aes(x = level_2_cat, y = log(price+1))) + 
+    geom_boxplot(fill = 'cyan2', color = 'darkgrey') + 
+    coord_flip() + 
+    labs(x = '', y = 'Log price + 1', title = 'Boxplot of price by second-level category')
+
+```
+
+## Feature Interactions {#interactions}
+
+We can examine how item counts are distributed across top-level category and condition.
+
+```{r, fig.width = 10}
+
+p1 <-
+    dtrain[, .N, by = c('level_1_cat', 'item_condition_id')] %>%
+    ggplot(aes(x = item_condition_id, y = level_1_cat, fill = N/1000)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'lightblue', high = 'cyan4') +
+    labs(x = 'Condition', y = '', fill = 'Number of items (000s)', title = 'Item count by category and condition') +
+    theme_bw() + 
+    theme(legend.position = 'bottom')
+    
+p2 <-
+    dtrain[, .(median_price = median(price)), by = c('level_1_cat', 'item_condition_id')] %>%
+    ggplot(aes(x = item_condition_id, y = level_1_cat, fill = median_price)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'lightblue', high = 'cyan4', labels = dollar) +
+    labs(x = 'Condition', y = '', fill = 'Median price', title = 'Item price by category and condition') + 
+    theme_bw() + 
+    theme(legend.position = 'bottom', axis.text.y = element_blank())
+    
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+Women's items of condition 1,2, and 3 are the most numerous. This is followed by Beauty products. 
+`
+
+## Item Description {#description}
+
+At this point, we've already done a significant amount of data exploration and we haven't even gotten to to real bulk of this problem, the descritption text. The description in unstructured data, so in order to explore it fully, we'll need to do some text processing and normalization. 
+
+Is there a relationship between description length and price?
+
+```{r}
+
+# calculate description length
+dtrain[, desc_length := nchar(item_description)]
+
+# set desc_length to NA where no description exists
+dtrain[item_description == 'No description yet', desc_length := NA]
+
+cor(dtrain$desc_length, dtrain$price, use = 'complete.obs')
+
+```
+
+There is no correlation between description length and price. 
+
+### Setup {#setup}
+
+Now let's begin the text analysis. We'll use the quanteda package to do this. First, we will remove from the description column any occurences of 'No description yet'. Then we will convert the description column into a `corpus` object. 
+
+```{r}
+
+dtrain[item_description == 'No description yet', item_description := NA]
+
+# create the corpus object from the item_description column
+dcorpus <- corpus(dtrain$item_description)
+
+# check first few lines of summary frame
+summary(dcorpus)[1:5, ]
+
+```
+
+We can use the `kwic()` (keyword-in-context) function to examine the context in which a given keyword appears. Here I do so for keyword "Urban Outfitters" and display the first 10 results. 
+
+```{r}
+
+options(width = 200)
+kwic(dcorpus, phrase("Kate Spade"), valuetype = "fixed") %>%
+    head()
+
+```
+
+Not let's create a document-term matrix of the descriptions. To do this, we use the `dfm()` function and pass in our corpus object. We start with individual words, remove english stopwords and punctuation, and stem words. 
+
+```{r}
+
+dfm1 <- dfm(
+    dcorpus, 
+    ngrams = 1, 
+    remove = c("rm", stopwords("english")),
+    remove_punct = TRUE,
+    remove_numbers = TRUE,
+    stem = TRUE)
+
+```
+
+## N-grams {#ngrams}
+
+```{r}
+# get 25 most common words
+tf <- topfeatures(dfm1, n = 25)
+
+# convert to df and plot
+data.frame(term = names(tf), freq = unname(tf)) %>%
+    ggplot(aes(x = reorder(term, freq), y = freq/1000)) + 
+    geom_bar(stat = 'identity', fill = 'orangered2') + 
+    labs(x = '', y = 'Frequency (000s)', title = '25 most common description words') + 
+    coord_flip() 
+
+```
+
+We can also use our `dfm` object to make a word cloud. Here I make a cloud with words that appear at least 30,000 times in the dataset.
+
+```{r}
+
+set.seed(100)
+textplot_wordcloud(dfm1, min.freq = 3e4, random.order = FALSE,
+                   rot.per = .25, 
+                   colors = RColorBrewer::brewer.pal(8,"Dark2"))
+```
+
+What if we wanted to look at ngrams? We can do so in a similar way, setting the `ngrams` argument in `dfm()` to 2. Because this will result in a very large document-term matrix and take a very long time, I use the `sample_corpus()` function to take a random sample of 15% of the documents in the corpus. 
+
+```{r}
+
+dfm2 <- dcorpus %>%
+    corpus_sample(size = floor(ndoc(dcorpus) * 0.15)) %>%
+    dfm(
+        ngrams = 2,
+        ignoredFeatures = c("rm", stopwords("english")),
+        remove_punct = TRUE,
+        remove_numbers = TRUE,
+        concatenator = " "
+    )
+
+
+```
+
+
+```{r}
+
+# get 25 most common bigrams
+tf <- topfeatures(dfm2, n = 25)
+
+# convert to df and plot
+data.frame(term = names(tf), freq = unname(tf)) %>%
+    ggplot(aes(x = reorder(term, freq), y = freq/1000)) + 
+    geom_bar(stat = 'identity', fill = 'orangered2') + 
+    labs(x = '', y = 'Frequency (000s)', title = '25 most common description bigrams') + 
+    coord_flip() 
+
+```
+
+'Brand new' is the most comonly-occuring bigram follow by 'free shipping'. We can also make a word cloud of bigrams.
+
+```{r}
+
+set.seed(100)
+textplot_wordcloud(dfm2, min.freq = 2000, random.order = FALSE,
+                   rot.per = .25, 
+                   colors = RColorBrewer::brewer.pal(8,"Dark2"))
+```
+
+Let's repeat this process one more time, this time with 3-grams.
+
+```{r}
+
+dfm3 <- dcorpus %>%
+    corpus_sample(size = floor(ndoc(dcorpus) * 0.15)) %>%
+    dfm(
+        ngrams = 3,
+        ignoredFeatures = c("rm", stopwords("english")),
+        remove_punct = TRUE,
+        remove_numbers = TRUE,
+        concatenator = " "
+    )
+
+```
+
+
+```{r}
+
+# get 25 most common trigrams
+tf <- topfeatures(dfm3, n = 25)
+
+# convert to df and plot
+data.frame(term = names(tf), freq = unname(tf)) %>%
+    ggplot(aes(x = reorder(term, freq), y = freq/1000)) + 
+    geom_bar(stat = 'identity', fill = 'orangered2') + 
+    labs(x = '', y = 'Frequency (000s)', title = '25 most common description 3-grams') + 
+    coord_flip() 
+
+```
+
+We see that 'price is firm' and 'new with tags' are the most common 3-grams by a large margin. 'Brand new never' (probably part of 'brand new never worn'), 'check out my', and 'smoke free home' are other popular trigrams. 
+
+```{r}
+
+set.seed(100)
+textplot_wordcloud(dfm3, min.freq = 100, random.order = FALSE,
+                   rot.per = .25, 
+                   colors = RColorBrewer::brewer.pal(8,"Dark2"))
+```
+
+Let's add some of the other training features to our corpus so that we can do further analysis. We can do this using the `docvars()` function from the `quanteda` package. 
+
+```{r}
+
+# Add other features as docvars
+docvars(dcorpus, "price") <- dtrain$price
+docvars(dcorpus, "brand_name") <- dtrain$brand_name
+docvars(dcorpus, "item_condition_id") <- dtrain$item_condition_id
+docvars(dcorpus, "level_1_cat") <- dtrain$level_1_cat
+docvars(dcorpus, "level_2_cat") <- dtrain$level_2_cat
+
+```
+ 
+ We start with a high level view using the summary of `dcorpus`. Here I plot the distribution of the number of tokens in each of the top-level categories. 
+ 
+```{r, fig.width = 10}
+
+
+p1 <- summary(dcorpus) %>%
+    ggplot(aes(x = level_1_cat, y = Tokens)) +
+    geom_boxplot(aes(fill = level_1_cat), color = 'grey') +
+    coord_flip() +
+    theme(legend.position = 'bottom') + 
+    labs(x = '', y = 'Number of tokens in description')
+
+p2 <- summary(dcorpus) %>%
+    ggplot(aes(x = Tokens)) +
+    geom_density(aes(fill = level_1_cat), color = 'grey') + 
+    facet_wrap(~level_1_cat) + 
+    theme(legend.position = "none") + 
+    labs(x = 'Number of tokens in description')
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+The most interesting thing that we see here is that the Men's category has the lowest average number of tokens in the description. Not only that it has the tightest distribution around the mean. Due to the lack of information this may mean that accurately predicting prices in this category will be most difficult. 
+
+
+
+More to come...
